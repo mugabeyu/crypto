@@ -2,18 +2,18 @@
 Watches the SHORT ONLY tab on the cryptoflowsignals.com signals page and
 returns fresh, qualifying signals for main.py to execute directly on
 Binance. This file ONLY reads the page — it never clicks Execute Trade,
-Precision Trade, or any order-placement button. Execution now happens
-via executor.py's direct Binance API calls, which is far more reliable
-than automating the site's UI.
+Precision Trade, or any order-placement button.
 
-FIXED (2026-09-26):
-- Replaced wait_for_load_state("networkidle") with domcontentloaded +
-  explicit wait_for_selector. On a live signals page with streaming
-  websockets, networkidle never fires and produces the 30s "Timeout
-  30000ms exceeded" you saw.
-- Set sane default navigation/action timeouts.
-- Throttled the "still running" log so it only prints when the set of
-  running symbols actually changes (was flooding the log every poll).
+FIXED v3 (2026-09-26):
+- v1: domcontentloaded waits (no more 30s networkidle timeouts),
+  throttled "still running" log, sane timeouts.
+- v2: parsed TP1/TP2/TP3 via label regexes.
+- v3: price parsing rewritten against the REAL card layout (5-column
+  table: ENTRY | TP1 | TP2 | TP3 | SL, each price prefixed with $, and a
+  separate "Current: $x" line below). We isolate the table segment
+  (ENTRY .. before "Progress"/"Current") and map the $ prices by position
+  — no guessing, no risk of grabbing a digit from "TP2" or the Current
+  price. Falls back to label-based regex if <5 prices found.
 """
 import logging
 import re
@@ -26,11 +26,7 @@ HEADLESS = False
 NAV_TIMEOUT_MS = 25000
 ACTION_TIMEOUT_MS = 12000
 
-# Confirmed working: each signal card has a unique id like
-# "signal-row-2045a1f4-90ea-4215-9de7-b643c30ec5a".
 SIGNAL_CARD_SELECTOR = 'div[id^="signal-row-"]'
-# Confirmed working: exact-text match avoids colliding with the same
-# words inside a card's own tag row.
 SHORT_ONLY_TAB_SELECTOR = 'text="SHORT ONLY"'
 
 
@@ -40,7 +36,7 @@ class Filters:
     skip_aged: bool
     skip_high_risk: bool
     max_age_minutes: float | None
-    max_progress_pct: float | None  # None = no limit on "Progress to TP3"
+    max_progress_pct: float | None
 
 
 @dataclass
@@ -56,6 +52,9 @@ class Signal:
     progress_to_tp3_pct: float | None
     entry_price: float | None
     sl_price: float | None
+    tp1_price: float | None
+    tp2_price: float | None
+    tp3_price: float | None
     raw_text: str
 
     def passes(self, f: Filters) -> bool:
@@ -102,7 +101,6 @@ class CryptoFlowSignalsScraper:
     def _login(self):
         page = self._page
         page.goto(self.login_url, wait_until="domcontentloaded")
-        # Confirmed working against the real /auth page.
         EMAIL_FIELD_SELECTOR = "input[placeholder='you@example.com']"
         PASSWORD_FIELD_SELECTOR = "input[type='password']"
         page.fill(EMAIL_FIELD_SELECTOR, self.email)
@@ -115,8 +113,6 @@ class CryptoFlowSignalsScraper:
         if submit is None:
             raise RuntimeError("Could not find the Sign In submit button.")
         submit.click()
-        # Wait for navigation away from the auth page, not networkidle
-        # (streaming connections keep it "busy" forever).
         try:
             page.wait_for_url(lambda u: "auth" not in u.lower() and "login" not in u.lower(),
                               timeout=15000)
@@ -132,8 +128,6 @@ class CryptoFlowSignalsScraper:
 
     def _goto_short_only_signals(self):
         page = self._page
-        # domcontentloaded is enough; the cards render shortly after and we
-        # wait for them explicitly below. networkidle hangs on this site.
         page.goto(self.dashboard_url, wait_until="domcontentloaded")
         try:
             page.wait_for_selector(SIGNAL_CARD_SELECTOR, timeout=12000, state="attached")
@@ -148,6 +142,14 @@ class CryptoFlowSignalsScraper:
                 logger.warning("Could not click SHORT ONLY tab: %s", e)
         else:
             logger.warning("Could not find the SHORT ONLY filter tab.")
+        # Prices lazy-render after the tab loads. Wait for at least one card
+        # to show a $ price before reading; if none appear, read anyway.
+        try:
+            page.wait_for_selector(
+                SIGNAL_CARD_SELECTOR + ':has-text("$")', timeout=6000,
+            )
+        except PWTimeoutError:
+            logger.debug("No card showed a $ price within 6s — reading anyway.")
 
     def _get_cards(self):
         return self._page.query_selector_all(SIGNAL_CARD_SELECTOR)
@@ -168,7 +170,7 @@ class CryptoFlowSignalsScraper:
             running_symbols.append(symbol_match.group(1) if symbol_match else "UNKNOWN")
         key = ",".join(sorted(running_symbols)) + f"|{completed_count}"
         if key == self._last_running_key:
-            return  # unchanged — don't flood the log
+            return
         self._last_running_key = key
         logger.info(
             "SHORT ONLY still running: %d (%s) — %d already in Today's Completed Wins.",
@@ -178,13 +180,6 @@ class CryptoFlowSignalsScraper:
         )
 
     def get_new_qualifying_signals(self, filters: Filters, seen: set) -> tuple[list[Signal], set]:
-        """
-        Navigates to SHORT ONLY signals and returns every new signal that
-        passes `filters`. Any new signal seen but filtered out is marked
-        seen so it isn't re-logged every poll. Qualifying signals are
-        NOT marked seen here — main.py marks them after a real execution
-        attempt, so a failed attempt can retry next poll.
-        """
         self._goto_short_only_signals()
         self._log_running_signals()
         cards = self._get_cards()
@@ -235,35 +230,87 @@ def _parse_age_minutes(upper_text: str) -> float | None:
     return None
 
 
+def _parse_prices(upper: str) -> tuple:
+    """
+    Real card layout (5 columns, each $-prefixed):
+        ENTRY $x | TP1 $x | TP2 $x | TP3 $x | SL $x
+    followed (below the table) by "Progress to TP3 …%" and "Current: $x".
+    We isolate the table segment and map $ prices by position. If fewer
+    than 5 found, fall back to label-anchored regexes.
+    Returns (entry, tp1, tp2, tp3, sl).
+    """
+    table_m = re.search(r"ENTRY(.{0,600}?)(?:PROGRESS\s+TO|CURRENT\s*:|\Z)", upper, re.DOTALL)
+    segment = table_m.group(1) if table_m else upper
+    prices = [_to_float(p) for p in re.findall(r"\$\s*([\d.,]+)", segment)]
+
+    entry = tp1 = tp2 = tp3 = sl = None
+
+    if len(prices) >= 5:
+        entry, tp1, tp2, tp3, sl = prices[:5]
+    else:
+        # Fallback: label-anchored, $ required. (?<!TO ) keeps "PROGRESS TO TP3"
+        # from being mistaken for a TP label.
+        def label_price(label_re: str) -> float | None:
+            m = re.search(label_re + r"[^$]{0,30}?\$\s*([\d.,]+)", segment)
+            return _to_float(m.group(1)) if m else None
+
+        entry = label_price(r"ENTRY")
+        tp1 = label_price(r"(?<!TO )(?:TP|TARGET)\s*1")
+        tp2 = label_price(r"(?<!TO )(?:TP|TARGET)\s*2")
+        tp3 = label_price(r"(?<!TO )(?:TP|TARGET)\s*3")
+        sl = label_price(r"\bSL")
+
+    return entry, tp1, tp2, tp3, sl
+
+
 def _parse_card(text: str, dom_id: str | None = None) -> Signal | None:
     upper = text.upper()
+    # Incomplete / not-yet-lazy-loaded card (no $ prices at all, e.g.
+    # 'LDOUSDT\nSHORT\n+0.22%'). Skip silently — retried next poll.
+    if "$" not in text:
+        return None
     symbol_match = re.search(r"\b([A-Z0-9]{1,15}(?:USDT|BUSD|USD))\b", upper)
     if not symbol_match:
         return None
     symbol = symbol_match.group(1)
+
     if "SHORT" in upper and "LONG" not in upper:
         side = "SHORT"
     elif "LONG" in upper and "SHORT" not in upper:
         side = "LONG"
     else:
         return None
+
     conf_match = re.search(r"AI CONFIDENCE\D{0,20}?(\d{1,3})\s*%", upper, re.DOTALL)
     if not conf_match:
         conf_match = re.search(r"ELITE\s*(\d{1,3})\s*%", upper)
     confidence = float(conf_match.group(1)) if conf_match else None
+
     elite = "ELITE" in upper
     aged = "AGED" in upper or "AGING" in upper or "STALE" in upper
     high_risk = "HIGH RISK" in upper
     age_minutes = _parse_age_minutes(upper)
+
     progress_match = re.search(r"PROGRESS TO TP3\D{0,10}?([+-]?\d+(?:\.\d+)?)\s*%", upper)
     progress_to_tp3_pct = float(progress_match.group(1)) if progress_match else None
-    entry_match = re.search(r"ENTRY\D{0,10}?\$?([\d.,]+)", upper)
-    sl_match = re.search(r"\bSL\D{0,10}?\$?([\d.,]+)", upper)
-    entry_str = entry_match.group(1) if entry_match else None
-    sl_str = sl_match.group(1) if sl_match else None
-    entry_price = _to_float(entry_str)
-    sl_price = _to_float(sl_str)
-    sig_id = dom_id or f"{symbol}_{side}_{entry_str or '?'}_{sl_str or '?'}"
+
+    entry_price, tp1_price, tp2_price, tp3_price, sl_price = _parse_prices(upper)
+
+    if sl_price is None:
+        logger.warning(
+            "Could not parse SL price for %s — parsed entry=%s tp1=%s tp2=%s tp3=%s. "
+            "Card text: %r", symbol, entry_price, tp1_price, tp2_price, tp3_price, text[:200],
+        )
+    if tp1_price is None and tp2_price is None and tp3_price is None:
+        logger.warning(
+            "No TP prices parsed for %s — will trade entry+SL only. Card text: %r",
+            symbol, text[:200],
+        )
+
+    entry_str = f"{entry_price}" if entry_price is not None else "?"
+    sl_str = f"{sl_price}" if sl_price is not None else "?"
+    sig_id = dom_id or f"{symbol}_{side}_{entry_str}_{sl_str}"
+
     return Signal(
         id=sig_id,
         symbol=symbol,
@@ -276,5 +323,8 @@ def _parse_card(text: str, dom_id: str | None = None) -> Signal | None:
         progress_to_tp3_pct=progress_to_tp3_pct,
         entry_price=entry_price,
         sl_price=sl_price,
+        tp1_price=tp1_price,
+        tp2_price=tp2_price,
+        tp3_price=tp3_price,
         raw_text=text,
     )

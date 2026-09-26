@@ -1,19 +1,18 @@
 """
-Places real orders on Binance USD-M Futures via the official API — entry
-market order + a matching stop-loss order, using each signal's own
-entry/SL prices. No browser interaction here at all; this only talks to
-Binance directly.
+Places real orders on Binance USD-M Futures via the official API:
+  - market entry order
+  - one stop-loss (closePosition, closes whatever remains)
+  - N partial take-profit orders (reduceOnly, split evenly across TP1/TP2/TP3)
+using each signal's own entry/SL/TP prices. No browser interaction here.
 
-FIXED (2026-09-26):
-- Auto-detects Hedge Mode (dualSidePosition) vs One-way Mode at startup,
-  and includes the required `positionSide` param in hedge mode. This is
-  what caused APIError -4061 "Order's position side does not match user's
-  setting."
-- If detection is wrong/impossible, a -4061 rejection flips the assumption
-  and retries the order once, so the bot adapts at runtime.
-- has_open_position() is now side-aware in hedge mode.
-- place_trade() now returns True for "handled" (placed / dry-run / skipped
-  duplicate) and False only for a hard failure that should be retried.
+FIXED v5 (2026-09-26):
+- v1: auto-detects Hedge Mode (dualSidePosition) vs One-way, sends
+  positionSide on every order (fixes -4061), runtime -4061 retry fallback,
+  side-aware has_open_position, True=handled / False=retry semantics.
+- v2: partial take-profit orders at TP1/TP2/TP3.
+- v5: position-mode detection is now LAZY — it makes ZERO Binance API calls
+  at startup. Detection runs only when the first qualifying signal is about
+  to be traded, so idle polling never contributes to rate-limit bans.
 """
 import logging
 from binance.client import Client
@@ -28,20 +27,18 @@ class BinanceFuturesExecutor:
         self.dry_run = dry_run
         self._step_size_cache: dict[str, float] = {}
         self._price_precision_cache: dict[str, int] = {}
+        self._min_notional_cache: dict[str, float] = {}
         # None = not yet detected; True = Hedge (dual-side); False = One-way.
+        # Lazy — detected on first real trade attempt (see _ensure_position_mode).
         self._dual_side: bool | None = None
-        self._detect_position_mode()
 
     # ------------------------------------------------------------------
-    # Position-mode handling (the -4061 fix)
+    # Position-mode handling (the -4061 fix) — LAZY
     # ------------------------------------------------------------------
-    def _detect_position_mode(self) -> None:
-        """Query Binance for dualSidePosition and cache it. Safe to fail."""
-        if self.dry_run:
-            # Can't rely on the key in dry run; assume one-way but runtime
-            # -4061 fallback below will correct it if needed.
-            self._dual_side = False
-            logger.info("DRY RUN: assuming one-way position mode until proven otherwise.")
+    def _ensure_position_mode(self) -> None:
+        """Detect dualSidePosition once, lazily, before the first real order.
+        No-op in dry run or if already detected."""
+        if self.dry_run or self._dual_side is not None:
             return
         try:
             info = self.client.futures_get_position_mode()
@@ -74,10 +71,12 @@ class BinanceFuturesExecutor:
     # ------------------------------------------------------------------
     # Symbol metadata / rounding
     # ------------------------------------------------------------------
-    def _get_step_size_and_precision(self, symbol: str) -> tuple[float, int]:
-        """Cached per-symbol quantity step size and price decimal precision."""
+    def _get_symbol_filters(self, symbol: str) -> tuple[float, int, float]:
+        """Cached (step_size, price_precision, min_notional)."""
         if symbol in self._step_size_cache:
-            return self._step_size_cache[symbol], self._price_precision_cache[symbol]
+            return (self._step_size_cache[symbol],
+                    self._price_precision_cache[symbol],
+                    self._min_notional_cache[symbol])
         info = self.client.futures_exchange_info()
         for s in info["symbols"]:
             if s["symbol"] == symbol:
@@ -85,9 +84,15 @@ class BinanceFuturesExecutor:
                     float(f["stepSize"]) for f in s["filters"] if f["filterType"] == "LOT_SIZE"
                 )
                 price_precision = s["pricePrecision"]
+                min_notional = next(
+                    (float(f.get("notional", 5.0)) for f in s["filters"]
+                     if f["filterType"] == "MIN_NOTIONAL"),
+                    5.0,
+                )
                 self._step_size_cache[symbol] = step_size
                 self._price_precision_cache[symbol] = price_precision
-                return step_size, price_precision
+                self._min_notional_cache[symbol] = min_notional
+                return step_size, price_precision, min_notional
         raise RuntimeError(f"Symbol {symbol} not found in futures_exchange_info().")
 
     def _round_step(self, quantity: float, step_size: float) -> float:
@@ -101,9 +106,6 @@ class BinanceFuturesExecutor:
     # Position checks
     # ------------------------------------------------------------------
     def has_open_position(self, symbol: str, signal_side: str | None = None) -> bool:
-        """True if there's already a non-zero position for this symbol.
-        In hedge mode, only the matching side counts (so an open LONG does
-        not block a new SHORT, and vice versa)."""
         positions = self.client.futures_position_information(symbol=symbol, recvWindow=20000)
         for p in positions:
             amt = float(p.get("positionAmt", 0) or 0)
@@ -113,15 +115,13 @@ class BinanceFuturesExecutor:
                 if p.get("positionSide") == signal_side:
                     return True
             else:
-                # One-way: any non-zero amount means the symbol is occupied.
                 return True
         return False
 
     # ------------------------------------------------------------------
-    # Order placement
+    # Order placement with -4061 fallback
     # ------------------------------------------------------------------
     def _create_order_with_mode_fallback(self, signal_side: str, **kwargs) -> dict:
-        """futures_create_order with a one-shot -4061 hedge/one-way toggle."""
         try:
             return self.client.futures_create_order(
                 **self._order_kwargs(signal_side, **kwargs)
@@ -129,7 +129,6 @@ class BinanceFuturesExecutor:
         except BinanceAPIException as e:
             if not self._is_position_side_mismatch(e):
                 raise
-            # Runtime correction: flip the assumption and retry exactly once.
             old = self._dual_side
             self._dual_side = not self._dual_side
             logger.warning(
@@ -140,14 +139,34 @@ class BinanceFuturesExecutor:
                 **self._order_kwargs(signal_side, **kwargs)
             )
 
+    def _split_into_portions(self, quantity: float, n: int, step_size: float) -> list[float]:
+        """Evenly split quantity into n step-rounded portions; the last
+        portion absorbs rounding error so their sum never exceeds quantity."""
+        portions = []
+        remaining = quantity
+        for i in range(n):
+            if i < n - 1:
+                p = self._round_step(quantity / n, step_size)
+            else:
+                p = self._round_step(remaining, step_size)
+            p = max(p, 0.0)
+            portions.append(p)
+            remaining -= p
+        return portions
+
     def place_trade(self, symbol: str, side: str, leverage: int, margin_usdt: float,
-                    sl_price: float) -> bool:
+                    sl_price: float, take_profits: list[float] | None = None) -> bool:
         """
         side: "SHORT" or "LONG" (as parsed from the signal).
-        Returns True if the signal is HANDLED (order placed, dry-run logged,
-        or skipped as a duplicate) — i.e. safe to mark seen.
-        Returns False only on a hard failure so main.py can retry next poll.
+        take_profits: list of TP prices (TP1..TP3). Partial closes split
+        evenly across the valid ones.
+        Returns True if HANDLED (placed / dry-run / skipped / dead signal).
+        Returns False only on a hard entry failure so main.py can retry.
         """
+        # Lazy: first Binance call of the whole run happens here, only when a
+        # qualifying signal actually exists. Zero calls while just polling.
+        self._ensure_position_mode()
+
         entry_side = "SELL" if side == "SHORT" else "BUY"
         close_side = "BUY" if side == "SHORT" else "SELL"
 
@@ -156,42 +175,61 @@ class BinanceFuturesExecutor:
                 "Skipping %s %s — matching position already open on Binance.",
                 symbol, side,
             )
-            return True  # handled — don't spam retries
+            return True
 
-        # Current mark price — safer than trusting the signal card's entry
-        # price, which may be stale by the time we act on it.
         mark_price = float(self.client.futures_mark_price(symbol=symbol)["markPrice"])
 
-        # Sanity check: if price already moved past the stop, placing this
-        # would trigger an instant stop-out — refuse instead.
+        # Sanity: price already past the stop → instant stop-out → refuse.
         if side == "SHORT" and mark_price >= sl_price:
             logger.warning(
-                "Refusing %s SHORT — mark price %s is already past the "
-                "stop-loss level %s.", symbol, mark_price, sl_price,
+                "Refusing %s SHORT — mark price %s already past SL %s.",
+                symbol, mark_price, sl_price,
             )
-            return True  # signal is dead — handled, don't retry
+            return True
         if side == "LONG" and mark_price <= sl_price:
             logger.warning(
-                "Refusing %s LONG — mark price %s is already past the "
-                "stop-loss level %s.", symbol, mark_price, sl_price,
+                "Refusing %s LONG — mark price %s already past SL %s.",
+                symbol, mark_price, sl_price,
             )
             return True
 
-        step_size, price_precision = self._get_step_size_and_precision(symbol)
+        step_size, price_precision, min_notional = self._get_symbol_filters(symbol)
         raw_qty = (margin_usdt * leverage) / mark_price
         quantity = self._round_step(raw_qty, step_size)
         sl_price_rounded = round(sl_price, price_precision)
 
         if quantity <= 0:
             logger.error("Computed zero quantity for %s — skipping.", symbol)
-            return True  # will never be valid for this symbol — handled
+            return True
+
+        # --- Validate / sanitize TP levels ---
+        valid_tps: list[float] = []
+        for tp in (take_profits or []):
+            if tp is None:
+                continue
+            tp_r = round(tp, price_precision)
+            # Direction sanity: SHORT profits when price falls → TP < mark.
+            if side == "SHORT" and tp_r >= mark_price:
+                logger.warning(
+                    "Skipping TP %s for %s SHORT — at/above mark %s (misparse?).",
+                    tp_r, symbol, mark_price,
+                )
+                continue
+            if side == "LONG" and tp_r <= mark_price:
+                logger.warning(
+                    "Skipping TP %s for %s LONG — at/below mark %s (misparse?).",
+                    tp_r, symbol, mark_price,
+                )
+                continue
+            valid_tps.append(tp_r)
 
         if self.dry_run:
+            tp_desc = ", ".join(f"{p}" for p in valid_tps) if valid_tps else "none parsed"
             logger.info(
-                "[DRY RUN] Would set %sx leverage, then place %s %s %s "
-                "(~%s USDT margin @ ~%s), with a STOP_MARKET at %s (%s to close).%s",
+                "[DRY RUN] Would set %sx leverage, place %s %s %s (~%s USDT @ ~%s), "
+                "SL STOP_MARKET at %s (%s to close), TPs at [%s] (partial reduce-only).%s",
                 leverage, entry_side, quantity, symbol, margin_usdt, mark_price,
-                sl_price_rounded, close_side,
+                sl_price_rounded, close_side, tp_desc,
                 " [positionSide=%s]" % side if self._dual_side else "",
             )
             return True
@@ -218,10 +256,7 @@ class BinanceFuturesExecutor:
             logger.error("Entry order FAILED for %s: %s", symbol, e)
             return False  # hard failure — retry next poll
 
-        # --- Stop loss (closes the position) ---
-        # In hedge mode, closePosition=True still requires positionSide,
-        # which _order_kwargs attaches. closePosition orders must NOT send
-        # quantity — we don't.
+        # --- Stop loss (closes whatever remains) ---
         try:
             sl_order = self._create_order_with_mode_fallback(
                 signal_side=side,
@@ -243,5 +278,47 @@ class BinanceFuturesExecutor:
                 "WITHOUT A STOP LOSS. Check Binance manually right now.",
                 symbol, e,
             )
-            # Entry succeeded — do NOT retry (would double the position).
+
+        # --- Take profits (partial reduce-only closes) ---
+        if valid_tps:
+            portions = self._split_into_portions(quantity, len(valid_tps), step_size)
+            for tp_r, qty_portion in zip(valid_tps, portions):
+                if qty_portion <= 0:
+                    continue
+                if qty_portion * tp_r < min_notional:
+                    logger.warning(
+                        "Skipping TP %s portion %s for %s — below min notional %s.",
+                        tp_r, qty_portion, symbol, min_notional,
+                    )
+                    continue
+                try:
+                    tp_kwargs = dict(
+                        symbol=symbol,
+                        side=close_side,
+                        type="TAKE_PROFIT_MARKET",
+                        stopPrice=tp_r,
+                        quantity=qty_portion,
+                        workingType="MARK_PRICE",
+                        recvWindow=20000,
+                    )
+                    # Binance rejects reduceOnly when positionSide is also
+                    # sent (Hedge Mode) — positionSide already makes it
+                    # redundant there. One-way mode still needs it explicitly.
+                    if not self._dual_side:
+                        tp_kwargs["reduceOnly"] = True
+                    tp_order = self._create_order_with_mode_fallback(
+                        signal_side=side, **tp_kwargs
+                    )
+                    logger.info(
+                        "Take-profit placed for %s at %s (qty %s, reduce-only): %s",
+                        symbol, tp_r, qty_portion, tp_order,
+                    )
+                except BinanceAPIException as e:
+                    logger.warning(
+                        "Take-profit at %s FAILED for %s: %s — SL still active.",
+                        tp_r, symbol, e,
+                    )
+        else:
+            logger.info("No valid TP levels for %s — entry+SL only.", symbol)
+
         return True

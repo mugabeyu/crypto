@@ -26,6 +26,22 @@ def save_seen(seen: set):
     SEEN_SIGNALS_FILE.write_text(json.dumps(list(seen)[-500:]))
 
 
+def _is_rate_banned(exc: Exception) -> bool:
+    """Binance -1003 = IP temporarily banned for too many requests."""
+    return getattr(exc, "code", None) == -1003
+
+
+def _is_invalid_symbol(exc: Exception) -> bool:
+    """Binance -1121 = this symbol doesn't exist on this API (e.g. testnet
+    lists far fewer symbols than mainnet). This can NEVER succeed by
+    retrying, so it should be given up on permanently, not retried every
+    poll — retrying forever just burns API calls for nothing."""
+    return getattr(exc, "code", None) == -1121
+
+
+RATE_BAN_BACKOFF_SECONDS = 60
+
+
 def main():
     load_dotenv()
     scraper = CryptoFlowSignalsScraper(
@@ -68,11 +84,14 @@ def main():
                 qualifying, seen = scraper.get_new_qualifying_signals(filters, seen)
                 save_seen(seen)
                 for sig in qualifying:
+                    tp_prices = [p for p in (sig.tp1_price, sig.tp2_price, sig.tp3_price)
+                                 if p is not None]
                     logger.info(
                         "QUALIFIES: %s %s (confidence=%s%%, age=%sm, progress=%s%%) "
-                        "leverage=%s margin=%s sl=%s",
+                        "leverage=%s margin=%s sl=%s tps=%s",
                         sig.symbol, sig.side, sig.confidence, sig.age_minutes,
                         sig.progress_to_tp3_pct, leverage, margin_usdt, sig.sl_price,
+                        tp_prices or "none-parsed",
                     )
                     if sig.sl_price is None:
                         logger.error(
@@ -82,12 +101,10 @@ def main():
                         )
                         continue
 
-                    # FIX: place_trade returns True only when HANDLED
-                    # (placed / dry-run / skipped duplicate / dead signal).
-                    # On False (hard failure, e.g. -4061, network) we do NOT
-                    # mark seen, so the same signal retries next poll.
-                    # Previously the return value was ignored and failed
-                    # trades were silently marked seen — never retried.
+                    # place_trade returns True only when HANDLED (placed /
+                    # dry-run / skipped duplicate / dead signal). On False
+                    # (hard failure, e.g. -4061, network) we do NOT mark seen,
+                    # so the same signal retries next poll.
                     try:
                         handled = executor.place_trade(
                             symbol=sig.symbol,
@@ -95,8 +112,32 @@ def main():
                             leverage=leverage,
                             margin_usdt=margin_usdt,
                             sl_price=sig.sl_price,
+                            take_profits=tp_prices,
                         )
                     except Exception as e:
+                        if _is_rate_banned(e):
+                            logger.warning(
+                                "Binance IP is rate-limit banned — backing off "
+                                "%ds before retrying. Stop the bot if this persists.",
+                                RATE_BAN_BACKOFF_SECONDS,
+                            )
+                            time.sleep(RATE_BAN_BACKOFF_SECONDS)
+                            logger.error(
+                                "Binance execution raised for %s: %s — "
+                                "NOT marking as seen, will retry next poll.",
+                                sig.symbol, e,
+                            )
+                            continue
+                        if _is_invalid_symbol(e):
+                            logger.error(
+                                "%s doesn't exist on this Binance API (e.g. not "
+                                "listed on testnet) — this can never succeed. "
+                                "Giving up on it permanently, not retrying.",
+                                sig.symbol,
+                            )
+                            seen.add(sig.id)
+                            save_seen(seen)
+                            continue
                         logger.error(
                             "Binance execution raised for %s: %s — "
                             "NOT marking as seen, will retry next poll.",
@@ -113,6 +154,12 @@ def main():
                             "retries on the next poll.", sig.symbol, sig.side,
                         )
             except Exception as e:
+                if _is_rate_banned(e):
+                    logger.warning(
+                        "Binance IP is rate-limit banned — backing off %ds.",
+                        RATE_BAN_BACKOFF_SECONDS,
+                    )
+                    time.sleep(RATE_BAN_BACKOFF_SECONDS)
                 logger.error("Poll failed, will retry: %s", e)
             time.sleep(poll_seconds)
     except KeyboardInterrupt:

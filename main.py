@@ -3,9 +3,7 @@ import logging
 import os
 import time
 from pathlib import Path
-
 from dotenv import load_dotenv
-
 from scraper import CryptoFlowSignalsScraper, Filters
 from executor import BinanceFuturesExecutor
 
@@ -30,7 +28,6 @@ def save_seen(seen: set):
 
 def main():
     load_dotenv()
-
     scraper = CryptoFlowSignalsScraper(
         email=os.environ["CFS_EMAIL"],
         password=os.environ["CFS_PASSWORD"],
@@ -59,10 +56,10 @@ def main():
     seen = load_seen()
     scraper.start()
     logger.info(
-        f"Started. dry_run={dry_run} min_confidence={filters.min_confidence} "
-        f"skip_aged={filters.skip_aged} skip_high_risk={filters.skip_high_risk} "
-        f"max_age_minutes={filters.max_age_minutes} max_progress_pct={filters.max_progress_pct} "
-        f"leverage={leverage} margin={margin_usdt}"
+        "Started. dry_run=%s min_confidence=%s skip_aged=%s skip_high_risk=%s "
+        "max_age_minutes=%s max_progress_pct=%s leverage=%s margin=%s",
+        dry_run, filters.min_confidence, filters.skip_aged, filters.skip_high_risk,
+        filters.max_age_minutes, filters.max_progress_pct, leverage, margin_usdt,
     )
 
     try:
@@ -70,40 +67,53 @@ def main():
             try:
                 qualifying, seen = scraper.get_new_qualifying_signals(filters, seen)
                 save_seen(seen)
-
                 for sig in qualifying:
                     logger.info(
-                        f"QUALIFIES: {sig.symbol} {sig.side} (confidence={sig.confidence}%, "
-                        f"age={sig.age_minutes}m, progress={sig.progress_to_tp3_pct}%) "
-                        f"leverage={leverage} margin={margin_usdt} sl={sig.sl_price}"
+                        "QUALIFIES: %s %s (confidence=%s%%, age=%sm, progress=%s%%) "
+                        "leverage=%s margin=%s sl=%s",
+                        sig.symbol, sig.side, sig.confidence, sig.age_minutes,
+                        sig.progress_to_tp3_pct, leverage, margin_usdt, sig.sl_price,
                     )
-
                     if sig.sl_price is None:
                         logger.error(
-                            f"No SL price parsed for {sig.symbol} — refusing to trade "
-                            f"without a stop loss. NOT marking as seen, will retry."
+                            "No SL price parsed for %s — refusing to trade "
+                            "without a stop loss. NOT marking as seen, will retry.",
+                            sig.symbol,
                         )
                         continue
 
+                    # FIX: place_trade returns True only when HANDLED
+                    # (placed / dry-run / skipped duplicate / dead signal).
+                    # On False (hard failure, e.g. -4061, network) we do NOT
+                    # mark seen, so the same signal retries next poll.
+                    # Previously the return value was ignored and failed
+                    # trades were silently marked seen — never retried.
                     try:
-                        executor.place_trade(
+                        handled = executor.place_trade(
                             symbol=sig.symbol,
                             side=sig.side,
                             leverage=leverage,
                             margin_usdt=margin_usdt,
                             sl_price=sig.sl_price,
                         )
-                        seen.add(sig.id)
-                        save_seen(seen)
                     except Exception as e:
                         logger.error(
-                            f"Binance execution failed for {sig.symbol}: {e} — "
-                            f"NOT marking as seen, will retry next poll."
+                            "Binance execution raised for %s: %s — "
+                            "NOT marking as seen, will retry next poll.",
+                            sig.symbol, e,
                         )
+                        continue
 
+                    if handled:
+                        seen.add(sig.id)
+                        save_seen(seen)
+                    else:
+                        logger.warning(
+                            "Trade for %s %s failed — left unmarked so it "
+                            "retries on the next poll.", sig.symbol, sig.side,
+                        )
             except Exception as e:
-                logger.error(f"Poll failed, will retry: {e}")
-
+                logger.error("Poll failed, will retry: %s", e)
             time.sleep(poll_seconds)
     except KeyboardInterrupt:
         logger.info("Stopping...")

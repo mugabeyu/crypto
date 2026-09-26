@@ -6,26 +6,29 @@ Precision Trade, or any order-placement button. Execution now happens
 via executor.py's direct Binance API calls, which is far more reliable
 than automating the site's UI.
 
-*** ONE THING STILL NEEDS VERIFYING ***
-SIGNAL_CARD_SELECTOR and SHORT_ONLY_TAB_SELECTOR below were confirmed
-against your real DevTools screenshots earlier and are working (per
-your logs). Login field selectors are also confirmed working. Nothing
-else here needs guesswork anymore.
+FIXED (2026-09-26):
+- Replaced wait_for_load_state("networkidle") with domcontentloaded +
+  explicit wait_for_selector. On a live signals page with streaming
+  websockets, networkidle never fires and produces the 30s "Timeout
+  30000ms exceeded" you saw.
+- Set sane default navigation/action timeouts.
+- Throttled the "still running" log so it only prints when the set of
+  running symbols actually changes (was flooding the log every poll).
 """
-
 import logging
 import re
 from dataclasses import dataclass
-from playwright.sync_api import sync_playwright, Page
+from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeoutError
 
 logger = logging.getLogger("cryptoflow_bot.scraper")
 
 HEADLESS = False
+NAV_TIMEOUT_MS = 25000
+ACTION_TIMEOUT_MS = 12000
 
 # Confirmed working: each signal card has a unique id like
 # "signal-row-2045a1f4-90ea-4215-9de7-b643c30ec5a".
 SIGNAL_CARD_SELECTOR = 'div[id^="signal-row-"]'
-
 # Confirmed working: exact-text match avoids colliding with the same
 # words inside a card's own tag row.
 SHORT_ONLY_TAB_SELECTOR = 'text="SHORT ONLY"'
@@ -80,11 +83,14 @@ class CryptoFlowSignalsScraper:
         self._playwright = None
         self._browser = None
         self._page: Page | None = None
+        self._last_running_key: str | None = None
 
     def start(self):
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(headless=HEADLESS)
         self._page = self._browser.new_page()
+        self._page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+        self._page.set_default_timeout(ACTION_TIMEOUT_MS)
         self._login()
 
     def stop(self):
@@ -95,15 +101,12 @@ class CryptoFlowSignalsScraper:
 
     def _login(self):
         page = self._page
-        page.goto(self.login_url)
-
+        page.goto(self.login_url, wait_until="domcontentloaded")
         # Confirmed working against the real /auth page.
         EMAIL_FIELD_SELECTOR = "input[placeholder='you@example.com']"
         PASSWORD_FIELD_SELECTOR = "input[type='password']"
-
         page.fill(EMAIL_FIELD_SELECTOR, self.email)
         page.fill(PASSWORD_FIELD_SELECTOR, self.password)
-
         submit = page.query_selector("button[type='submit']")
         if submit is None:
             matches = page.query_selector_all('text="Sign In"')
@@ -112,8 +115,13 @@ class CryptoFlowSignalsScraper:
         if submit is None:
             raise RuntimeError("Could not find the Sign In submit button.")
         submit.click()
-        page.wait_for_load_state("networkidle")
-
+        # Wait for navigation away from the auth page, not networkidle
+        # (streaming connections keep it "busy" forever).
+        try:
+            page.wait_for_url(lambda u: "auth" not in u.lower() and "login" not in u.lower(),
+                              timeout=15000)
+        except PWTimeoutError:
+            pass
         if "auth" in page.url.lower() or "login" in page.url.lower():
             raise RuntimeError(
                 "Still on the login page after submitting — check your "
@@ -124,13 +132,20 @@ class CryptoFlowSignalsScraper:
 
     def _goto_short_only_signals(self):
         page = self._page
-        page.goto(self.dashboard_url)
-        page.wait_for_load_state("networkidle")
-
+        # domcontentloaded is enough; the cards render shortly after and we
+        # wait for them explicitly below. networkidle hangs on this site.
+        page.goto(self.dashboard_url, wait_until="domcontentloaded")
+        try:
+            page.wait_for_selector(SIGNAL_CARD_SELECTOR, timeout=12000, state="attached")
+        except PWTimeoutError:
+            logger.warning("No signal cards appeared within timeout — continuing anyway.")
         tab = page.query_selector(SHORT_ONLY_TAB_SELECTOR)
         if tab:
-            tab.click()
-            page.wait_for_timeout(500)
+            try:
+                tab.click()
+                page.wait_for_timeout(800)
+            except Exception as e:
+                logger.warning("Could not click SHORT ONLY tab: %s", e)
         else:
             logger.warning("Could not find the SHORT ONLY filter tab.")
 
@@ -141,7 +156,6 @@ class CryptoFlowSignalsScraper:
         cards = self._get_cards()
         running_symbols = []
         completed_count = 0
-
         for card in cards:
             text = card.inner_text().strip()
             if not text:
@@ -152,11 +166,15 @@ class CryptoFlowSignalsScraper:
                 continue
             symbol_match = re.search(r"\b([A-Z0-9]{1,15}(?:USDT|BUSD|USD))\b", upper)
             running_symbols.append(symbol_match.group(1) if symbol_match else "UNKNOWN")
-
+        key = ",".join(sorted(running_symbols)) + f"|{completed_count}"
+        if key == self._last_running_key:
+            return  # unchanged — don't flood the log
+        self._last_running_key = key
         logger.info(
-            f"SHORT ONLY still running: {len(running_symbols)} "
-            f"({', '.join(running_symbols) if running_symbols else 'none'}) — "
-            f"{completed_count} already in Today's Completed Wins on this page."
+            "SHORT ONLY still running: %d (%s) — %d already in Today's Completed Wins.",
+            len(running_symbols),
+            ", ".join(running_symbols) if running_symbols else "none",
+            completed_count,
         )
 
     def get_new_qualifying_signals(self, filters: Filters, seen: set) -> tuple[list[Signal], set]:
@@ -169,10 +187,8 @@ class CryptoFlowSignalsScraper:
         """
         self._goto_short_only_signals()
         self._log_running_signals()
-
         cards = self._get_cards()
-        logger.info(f"Found {len(cards)} card(s) under SHORT ONLY")
-
+        logger.info("Found %d card(s) under SHORT ONLY", len(cards))
         qualifying = []
         for card in cards:
             text = card.inner_text().strip()
@@ -183,21 +199,20 @@ class CryptoFlowSignalsScraper:
             dom_id = card.get_attribute("id") or None
             sig = _parse_card(text, dom_id)
             if sig is None:
-                logger.warning(f"Could not parse a card, skipping: {text[:80]!r}")
+                logger.warning("Could not parse a card, skipping: %r", text[:80])
                 continue
             if sig.id in seen:
                 continue
             if not sig.passes(filters):
                 logger.info(
-                    f"Skipping {sig.symbol} {sig.side} — filtered out "
-                    f"(confidence={sig.confidence}, age={sig.age_minutes}m, "
-                    f"progress={sig.progress_to_tp3_pct}%, aged={sig.aged}, "
-                    f"high_risk={sig.high_risk})"
+                    "Skipping %s %s — filtered out (confidence=%s, age=%sm, "
+                    "progress=%s%%, aged=%s, high_risk=%s)",
+                    sig.symbol, sig.side, sig.confidence, sig.age_minutes,
+                    sig.progress_to_tp3_pct, sig.aged, sig.high_risk,
                 )
                 seen.add(sig.id)
                 continue
             qualifying.append(sig)
-
         return qualifying, seen
 
 
@@ -222,41 +237,33 @@ def _parse_age_minutes(upper_text: str) -> float | None:
 
 def _parse_card(text: str, dom_id: str | None = None) -> Signal | None:
     upper = text.upper()
-
     symbol_match = re.search(r"\b([A-Z0-9]{1,15}(?:USDT|BUSD|USD))\b", upper)
     if not symbol_match:
         return None
     symbol = symbol_match.group(1)
-
     if "SHORT" in upper and "LONG" not in upper:
         side = "SHORT"
     elif "LONG" in upper and "SHORT" not in upper:
         side = "LONG"
     else:
         return None
-
     conf_match = re.search(r"AI CONFIDENCE\D{0,20}?(\d{1,3})\s*%", upper, re.DOTALL)
     if not conf_match:
         conf_match = re.search(r"ELITE\s*(\d{1,3})\s*%", upper)
     confidence = float(conf_match.group(1)) if conf_match else None
-
     elite = "ELITE" in upper
     aged = "AGED" in upper or "AGING" in upper or "STALE" in upper
     high_risk = "HIGH RISK" in upper
     age_minutes = _parse_age_minutes(upper)
-
     progress_match = re.search(r"PROGRESS TO TP3\D{0,10}?([+-]?\d+(?:\.\d+)?)\s*%", upper)
     progress_to_tp3_pct = float(progress_match.group(1)) if progress_match else None
-
     entry_match = re.search(r"ENTRY\D{0,10}?\$?([\d.,]+)", upper)
     sl_match = re.search(r"\bSL\D{0,10}?\$?([\d.,]+)", upper)
     entry_str = entry_match.group(1) if entry_match else None
     sl_str = sl_match.group(1) if sl_match else None
     entry_price = _to_float(entry_str)
     sl_price = _to_float(sl_str)
-
     sig_id = dom_id or f"{symbol}_{side}_{entry_str or '?'}_{sl_str or '?'}"
-
     return Signal(
         id=sig_id,
         symbol=symbol,

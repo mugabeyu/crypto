@@ -4,16 +4,12 @@ returns fresh, qualifying signals for main.py to execute directly on
 Binance. This file ONLY reads the page — it never clicks Execute Trade,
 Precision Trade, or any order-placement button.
 
-FIXED v3 (2026-09-26):
-- v1: domcontentloaded waits (no more 30s networkidle timeouts),
-  throttled "still running" log, sane timeouts.
-- v2: parsed TP1/TP2/TP3 via label regexes.
-- v3: price parsing rewritten against the REAL card layout (5-column
-  table: ENTRY | TP1 | TP2 | TP3 | SL, each price prefixed with $, and a
-  separate "Current: $x" line below). We isolate the table segment
-  (ENTRY .. before "Progress"/"Current") and map the $ prices by position
-  — no guessing, no risk of grabbing a digit from "TP2" or the Current
-  price. Falls back to label-based regex if <5 prices found.
+Card layout (5-column price table, each $-prefixed):
+    ENTRY $x | TP1 $x | TP2 $x | TP3 $x | SL $x
+followed (below) by "Progress to TP3 …%" and "Current: $x".
+We isolate the table segment and map $ prices by position, so TPs are
+read exactly — no guessing. Cards with no $ yet (still lazy-loading) are
+skipped silently and retried next poll.
 """
 import logging
 import re
@@ -142,12 +138,9 @@ class CryptoFlowSignalsScraper:
                 logger.warning("Could not click SHORT ONLY tab: %s", e)
         else:
             logger.warning("Could not find the SHORT ONLY filter tab.")
-        # Prices lazy-render after the tab loads. Wait for at least one card
-        # to show a $ price before reading; if none appear, read anyway.
+        # Wait for $ prices to lazy-render before reading cards.
         try:
-            page.wait_for_selector(
-                SIGNAL_CARD_SELECTOR + ':has-text("$")', timeout=6000,
-            )
+            page.wait_for_selector(SIGNAL_CARD_SELECTOR + ':has-text("$")', timeout=6000)
         except PWTimeoutError:
             logger.debug("No card showed a $ price within 6s — reading anyway.")
 
@@ -194,8 +187,7 @@ class CryptoFlowSignalsScraper:
             dom_id = card.get_attribute("id") or None
             sig = _parse_card(text, dom_id)
             if sig is None:
-                logger.warning("Could not parse a card, skipping: %r", text[:80])
-                continue
+                continue  # incomplete/unloaded card — retried next poll
             if sig.id in seen:
                 continue
             if not sig.passes(filters):
@@ -232,41 +224,32 @@ def _parse_age_minutes(upper_text: str) -> float | None:
 
 def _parse_prices(upper: str) -> tuple:
     """
-    Real card layout (5 columns, each $-prefixed):
-        ENTRY $x | TP1 $x | TP2 $x | TP3 $x | SL $x
-    followed (below the table) by "Progress to TP3 …%" and "Current: $x".
-    We isolate the table segment and map $ prices by position. If fewer
-    than 5 found, fall back to label-anchored regexes.
-    Returns (entry, tp1, tp2, tp3, sl).
+    Isolate the ENTRY..SL price table (stop before "Progress"/"Current" so
+    "Current: $x" never pollutes), then map $ prices by position:
+    [entry, tp1, tp2, tp3, sl]. Fall back to label-anchored regex if <5 found.
     """
     table_m = re.search(r"ENTRY(.{0,600}?)(?:PROGRESS\s+TO|CURRENT\s*:|\Z)", upper, re.DOTALL)
     segment = table_m.group(1) if table_m else upper
     prices = [_to_float(p) for p in re.findall(r"\$\s*([\d.,]+)", segment)]
 
     entry = tp1 = tp2 = tp3 = sl = None
-
     if len(prices) >= 5:
         entry, tp1, tp2, tp3, sl = prices[:5]
     else:
-        # Fallback: label-anchored, $ required. (?<!TO ) keeps "PROGRESS TO TP3"
-        # from being mistaken for a TP label.
         def label_price(label_re: str) -> float | None:
             m = re.search(label_re + r"[^$]{0,30}?\$\s*([\d.,]+)", segment)
             return _to_float(m.group(1)) if m else None
-
         entry = label_price(r"ENTRY")
         tp1 = label_price(r"(?<!TO )(?:TP|TARGET)\s*1")
         tp2 = label_price(r"(?<!TO )(?:TP|TARGET)\s*2")
         tp3 = label_price(r"(?<!TO )(?:TP|TARGET)\s*3")
         sl = label_price(r"\bSL")
-
     return entry, tp1, tp2, tp3, sl
 
 
 def _parse_card(text: str, dom_id: str | None = None) -> Signal | None:
     upper = text.upper()
-    # Incomplete / not-yet-lazy-loaded card (no $ prices at all, e.g.
-    # 'LDOUSDT\nSHORT\n+0.22%'). Skip silently — retried next poll.
+    # Incomplete / not-yet-lazy-loaded card (no $ prices) — skip silently.
     if "$" not in text:
         return None
     symbol_match = re.search(r"\b([A-Z0-9]{1,15}(?:USDT|BUSD|USD))\b", upper)
@@ -296,14 +279,9 @@ def _parse_card(text: str, dom_id: str | None = None) -> Signal | None:
 
     entry_price, tp1_price, tp2_price, tp3_price, sl_price = _parse_prices(upper)
 
-    if sl_price is None:
-        logger.warning(
-            "Could not parse SL price for %s — parsed entry=%s tp1=%s tp2=%s tp3=%s. "
-            "Card text: %r", symbol, entry_price, tp1_price, tp2_price, tp3_price, text[:200],
-        )
     if tp1_price is None and tp2_price is None and tp3_price is None:
         logger.warning(
-            "No TP prices parsed for %s — will trade entry+SL only. Card text: %r",
+            "No TP prices parsed for %s — will trade entry only. Card: %r",
             symbol, text[:200],
         )
 

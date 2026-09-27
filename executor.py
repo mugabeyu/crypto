@@ -2,14 +2,28 @@
 Places real LIVE orders on Binance USD-M Futures via the official API:
   - market entry order
   - N partial take-profit orders (reduceOnly, split evenly across TP1/TP2/TP3)
-No stop-loss (per user request), no testnet, no dry-run: every qualifying
-signal is executed live. Hedge Mode (positionSide) is auto-detected.
+No stop-loss (per user request), no testnet, no dry-run.
+
+RATE-LIMIT PROTECTION (circuit breaker):
+- Position-mode detection is LAZY — zero Binance calls at startup, only when
+  a qualifying signal is about to be traded.
+- Every Binance call goes through _call(), which on -1003 ("IP banned")
+  parses the ban-until timestamp from the error message and sets a cooldown.
+- While in cooldown, place_trade() returns immediately (no Binance calls)
+  so the bot can never hammer Binance and extend a ban. Backoff doubles on
+  each ban (60s -> 120s -> 240s ... cap 1h) and resets on any success.
+- This protects ALL callers (main.py loop, manual_trade.py, etc.) because
+  the breaker lives in the executor itself.
 """
 import logging
+import re
+import time
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
 logger = logging.getLogger("cryptoflow_bot.executor")
+
+_BAN_UNTIL_RE = re.compile(r"banned until (\d+)")
 
 
 class BinanceFuturesExecutor:
@@ -20,30 +34,71 @@ class BinanceFuturesExecutor:
         self._price_precision_cache: dict[str, int] = {}
         self._min_notional_cache: dict[str, float] = {}
         # None = not yet detected; True = Hedge (dual-side); False = One-way.
+        # LAZY — detected only when a real trade is about to be placed.
         self._dual_side: bool | None = None
-        self._detect_position_mode()
+        # Circuit-breaker state.
+        self._cooldown_until: float = 0.0
+        self._backoff_seconds: float = 60.0
 
     # ------------------------------------------------------------------
-    # Position-mode handling (the -4061 fix)
+    # Rate-limit circuit breaker
     # ------------------------------------------------------------------
-    def _detect_position_mode(self) -> None:
+    def _in_cooldown(self) -> bool:
+        return time.time() < self._cooldown_until
+
+    def _apply_ban_cooldown(self, error_msg: str) -> None:
+        """On -1003, set cooldown to max(backoff, ban-until). Doubles backoff."""
+        now = time.time()
+        cooldown_until = now + self._backoff_seconds
+        m = _BAN_UNTIL_RE.search(error_msg or "")
+        if m:
+            try:
+                ban_until_s = int(m.group(1)) / 1000.0
+                if ban_until_s > cooldown_until:
+                    cooldown_until = ban_until_s
+            except ValueError:
+                pass
+        self._cooldown_until = cooldown_until
+        wait = int(cooldown_until - now)
+        logger.warning(
+            "Binance -1003 rate-limit ban — entering cooldown for ~%ds (until "
+            "epoch %.0f). No Binance calls will be made until then. "
+            "Next backoff: %ds.",
+            max(wait, 0), cooldown_until, min(self._backoff_seconds * 2, 3600),
+        )
+        self._backoff_seconds = min(self._backoff_seconds * 2, 3600.0)
+
+    def _call(self, method_name: str, *args, **kwargs):
+        """Call a Binance client method. Returns None on -1003 (cooldown set);
+        resets backoff on success; re-raises any other API error."""
         try:
-            info = self.client.futures_get_position_mode()
-            self._dual_side = bool(info.get("dualSidePosition", False))
-            logger.info(
-                "Binance position mode detected: %s.",
-                "HEDGE (dual-side) — will send positionSide on every order."
-                if self._dual_side
-                else "ONE-WAY — positionSide omitted (correct for this mode).",
-            )
-        except Exception as e:
-            logger.warning(
-                "Could not detect position mode (%s) — assuming one-way. "
-                "If your account is in Hedge Mode, the first order will get "
-                "-4061 and the bot will auto-correct and retry.",
-                e,
-            )
-            self._dual_side = False
+            result = getattr(self.client, method_name)(*args, **kwargs)
+            self._backoff_seconds = 60.0  # any success resets the backoff
+            return result
+        except BinanceAPIException as e:
+            if getattr(e, "code", None) == -1003:
+                self._apply_ban_cooldown(str(e))
+                return None
+            raise
+
+    # ------------------------------------------------------------------
+    # Position-mode handling (the -4061 fix) — LAZY
+    # ------------------------------------------------------------------
+    def _ensure_position_mode(self) -> bool:
+        """Detect dualSidePosition once, lazily. Returns False if banned."""
+        if self._dual_side is not None:
+            return True
+        info = self._call("futures_get_position_mode")
+        if info is None:
+            return False  # rate-limited — cooldown set, skip this signal
+        self._dual_side = bool(info.get("dualSidePosition", False))
+        logger.info(
+            "Binance position mode detected: %s.",
+            "HEDGE (dual-side) — will send positionSide on every order."
+            if self._dual_side
+            else "ONE-WAY — positionSide omitted (correct for this mode).",
+        )
+        return True
 
     def _order_kwargs(self, signal_side: str, **base) -> dict:
         if self._dual_side:
@@ -57,13 +112,15 @@ class BinanceFuturesExecutor:
     # ------------------------------------------------------------------
     # Symbol metadata / rounding
     # ------------------------------------------------------------------
-    def _get_symbol_filters(self, symbol: str) -> tuple[float, int, float]:
-        """Cached (step_size, price_precision, min_notional)."""
+    def _get_symbol_filters(self, symbol: str):
+        """Cached (step_size, price_precision, min_notional). None if banned."""
         if symbol in self._step_size_cache:
             return (self._step_size_cache[symbol],
                     self._price_precision_cache[symbol],
                     self._min_notional_cache[symbol])
-        info = self.client.futures_exchange_info()
+        info = self._call("futures_exchange_info")
+        if info is None:
+            return None
         for s in info["symbols"]:
             if s["symbol"] == symbol:
                 step_size = next(
@@ -89,8 +146,6 @@ class BinanceFuturesExecutor:
         return int(quantity * factor) / factor
 
     def _split_into_portions(self, quantity: float, n: int, step_size: float) -> list[float]:
-        """Evenly split into n step-rounded portions; last absorbs rounding
-        error so sum never exceeds quantity."""
         portions = []
         remaining = quantity
         for i in range(n):
@@ -106,8 +161,11 @@ class BinanceFuturesExecutor:
     # ------------------------------------------------------------------
     # Position checks
     # ------------------------------------------------------------------
-    def has_open_position(self, symbol: str, signal_side: str | None = None) -> bool:
-        positions = self.client.futures_position_information(symbol=symbol, recvWindow=20000)
+    def has_open_position(self, symbol: str, signal_side: str | None = None):
+        """True/False, or None if rate-limited."""
+        positions = self._call("futures_position_information", symbol=symbol, recvWindow=20000)
+        if positions is None:
+            return None
         for p in positions:
             amt = float(p.get("positionAmt", 0) or 0)
             if amt == 0:
@@ -122,11 +180,12 @@ class BinanceFuturesExecutor:
     # ------------------------------------------------------------------
     # Order placement with -4061 fallback
     # ------------------------------------------------------------------
-    def _create_order_with_mode_fallback(self, signal_side: str, **kwargs) -> dict:
+    def _create_order_with_mode_fallback(self, signal_side: str, **kwargs):
+        """Returns order dict, None if rate-limited (-1003)."""
         try:
-            return self.client.futures_create_order(
-                **self._order_kwargs(signal_side, **kwargs)
-            )
+            result = self._call("futures_create_order",
+                                **self._order_kwargs(signal_side, **kwargs))
+            return result  # dict or None
         except BinanceAPIException as e:
             if not self._is_position_side_mismatch(e):
                 raise
@@ -136,38 +195,59 @@ class BinanceFuturesExecutor:
                 "Got -4061 position-side mismatch — flipped mode assumption "
                 "%s -> %s and retrying.", old, self._dual_side,
             )
-            return self.client.futures_create_order(
-                **self._order_kwargs(signal_side, **kwargs)
-            )
+            return self._call("futures_create_order",
+                              **self._order_kwargs(signal_side, **kwargs))
 
     def place_trade(self, symbol: str, side: str, leverage: int, margin_usdt: float,
                     take_profits: list[float] | None = None) -> bool:
         """
         LIVE market entry + partial reduce-only take-profits at TP1/TP2/TP3.
         No stop-loss (per config).
-        Returns True if HANDLED (placed / skipped duplicate). Returns False
-        only on a hard entry failure so main.py can retry next poll.
+        Returns True if HANDLED (placed / skipped duplicate). Returns False on
+        hard failure OR rate-limit cooldown — main.py retries next poll.
         """
+        # Circuit breaker: skip Binance entirely while cooldown is active.
+        if self._in_cooldown():
+            logger.warning(
+                "Binance cooldown active until epoch %.0f — skipping %s %s "
+                "execution attempt (will retry later).",
+                self._cooldown_until, symbol, side,
+            )
+            return False
+
+        if not self._ensure_position_mode():
+            return False  # rate-limited during detection
+
         entry_side = "SELL" if side == "SHORT" else "BUY"
         close_side = "BUY" if side == "SHORT" else "SELL"
 
-        if self.has_open_position(symbol, signal_side=side):
+        already_open = self.has_open_position(symbol, signal_side=side)
+        if already_open is None:
+            return False  # rate-limited
+        if already_open:
             logger.info(
                 "Skipping %s %s — matching position already open on Binance.",
                 symbol, side,
             )
             return True
 
-        mark_price = float(self.client.futures_mark_price(symbol=symbol)["markPrice"])
-        step_size, price_precision, min_notional = self._get_symbol_filters(symbol)
+        mark = self._call("futures_mark_price", symbol=symbol)
+        if mark is None:
+            return False
+        mark_price = float(mark["markPrice"])
+
+        filters = self._get_symbol_filters(symbol)
+        if filters is None:
+            return False
+        step_size, price_precision, min_notional = filters
+
         raw_qty = (margin_usdt * leverage) / mark_price
         quantity = self._round_step(raw_qty, step_size)
-
         if quantity <= 0:
             logger.error("Computed zero quantity for %s — skipping.", symbol)
             return True
 
-        # Validate TP direction: SHORT profits when price falls → TP < mark.
+        # Validate TP direction: SHORT profits when price falls -> TP < mark.
         valid_tps: list[float] = []
         for tp in (take_profits or []):
             if tp is None:
@@ -187,12 +267,7 @@ class BinanceFuturesExecutor:
                 continue
             valid_tps.append(tp_r)
 
-        try:
-            self.client.futures_change_leverage(
-                symbol=symbol, leverage=leverage, recvWindow=20000,
-            )
-        except BinanceAPIException as e:
-            logger.warning("Could not set leverage for %s: %s", symbol, e)
+        self._call("futures_change_leverage", symbol=symbol, leverage=leverage, recvWindow=20000)
 
         # --- LIVE entry (market) ---
         try:
@@ -204,13 +279,15 @@ class BinanceFuturesExecutor:
                 quantity=quantity,
                 recvWindow=20000,
             )
-            logger.info(
-                "LIVE entry placed for %s %s: qty=%s @ ~%s — %s",
-                symbol, side, quantity, mark_price, order,
-            )
         except BinanceAPIException as e:
             logger.error("Entry order FAILED for %s: %s", symbol, e)
-            return False  # hard failure — retry next poll
+            return False
+        if order is None:
+            return False  # rate-limited
+        logger.info(
+            "LIVE entry placed for %s %s: qty=%s @ ~%s — %s",
+            symbol, side, quantity, mark_price, order,
+        )
 
         # --- Take profits (partial reduce-only closes) ---
         if valid_tps:
@@ -225,25 +302,34 @@ class BinanceFuturesExecutor:
                     )
                     continue
                 try:
-                    tp_order = self._create_order_with_mode_fallback(
-                        signal_side=side,
+                    tp_kwargs = dict(
                         symbol=symbol,
                         side=close_side,
                         type="TAKE_PROFIT_MARKET",
                         stopPrice=tp_r,
                         quantity=qty_portion,
-                        reduceOnly=True,
                         workingType="MARK_PRICE",
                         recvWindow=20000,
                     )
-                    logger.info(
-                        "Take-profit placed for %s at %s (qty %s, reduce-only): %s",
-                        symbol, tp_r, qty_portion, tp_order,
+                    # Binance rejects reduceOnly when positionSide is also
+                    # sent (Hedge Mode) — positionSide alone already makes
+                    # it a reduce-only order there. One-way mode still
+                    # needs reduceOnly explicit.
+                    if not self._dual_side:
+                        tp_kwargs["reduceOnly"] = True
+                    tp_order = self._create_order_with_mode_fallback(
+                        signal_side=side, **tp_kwargs
                     )
                 except BinanceAPIException as e:
-                    logger.warning(
-                        "Take-profit at %s FAILED for %s: %s", tp_r, symbol, e,
-                    )
+                    logger.warning("Take-profit at %s FAILED for %s: %s", tp_r, symbol, e)
+                    continue
+                if tp_order is None:
+                    logger.warning("Take-profit at %s skipped — rate-limited.", tp_r)
+                    continue
+                logger.info(
+                    "Take-profit placed for %s at %s (qty %s, reduce-only): %s",
+                    symbol, tp_r, qty_portion, tp_order,
+                )
         else:
             logger.info("No valid TP levels for %s — entry only.", symbol)
 

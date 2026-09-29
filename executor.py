@@ -4,6 +4,18 @@ Places real LIVE orders on Binance USD-M Futures via the official API:
   - N partial take-profit orders (reduceOnly, split evenly across TP1/TP2/TP3)
 No stop-loss (per user request), no testnet, no dry-run.
 
+BINANCE ALGO ORDER MIGRATION (2025-12-09):
+Binance moved conditional order types (STOP_MARKET, TAKE_PROFIT_MARKET,
+etc.) to a separate endpoint (/fapi/v1/algoOrder) on 2025-12-09. The old
+/fapi/v1/order endpoint now hard-rejects them with -4120 ("Order type
+not supported for this endpoint. Please use the Algo Order API
+endpoints instead."). Take-profit orders here go through
+futures_create_algo_order() instead of futures_create_order() — this
+requires python-binance >=1.0.36 (pin in requirements.txt), and that
+endpoint renamed the price parameter from stopPrice to triggerPrice.
+The regular MARKET entry order is unaffected — only conditional/trigger
+order types moved.
+
 RATE-LIMIT PROTECTION (circuit breaker):
 - Position-mode detection is LAZY — zero Binance calls at startup, only when
   a qualifying signal is about to be traded.
@@ -198,6 +210,32 @@ class BinanceFuturesExecutor:
             return self._call("futures_create_order",
                               **self._order_kwargs(signal_side, **kwargs))
 
+    def _create_algo_order_with_mode_fallback(self, signal_side: str, **kwargs):
+        """
+        Same -4061 fallback pattern as _create_order_with_mode_fallback,
+        but for CONDITIONAL order types (STOP_MARKET, TAKE_PROFIT_MARKET,
+        etc.), which Binance moved to a separate endpoint on 2025-12-09.
+        The old /fapi/v1/order endpoint now hard-rejects these with -4120;
+        python-binance >=1.0.36 exposes the new endpoint as
+        futures_create_algo_order(), which also renamed stopPrice ->
+        triggerPrice. Returns order dict, None if rate-limited (-1003).
+        """
+        try:
+            result = self._call("futures_create_algo_order",
+                                **self._order_kwargs(signal_side, **kwargs))
+            return result
+        except BinanceAPIException as e:
+            if not self._is_position_side_mismatch(e):
+                raise
+            old = self._dual_side
+            self._dual_side = not self._dual_side
+            logger.warning(
+                "Got -4061 position-side mismatch on algo order — flipped "
+                "mode assumption %s -> %s and retrying.", old, self._dual_side,
+            )
+            return self._call("futures_create_algo_order",
+                              **self._order_kwargs(signal_side, **kwargs))
+
     def place_trade(self, symbol: str, side: str, leverage: int, margin_usdt: float,
                     take_profits: list[float] | None = None) -> bool:
         """
@@ -306,7 +344,7 @@ class BinanceFuturesExecutor:
                         symbol=symbol,
                         side=close_side,
                         type="TAKE_PROFIT_MARKET",
-                        stopPrice=tp_r,
+                        triggerPrice=tp_r,  # new algo endpoint renamed stopPrice -> triggerPrice
                         quantity=qty_portion,
                         workingType="MARK_PRICE",
                         recvWindow=20000,
@@ -317,7 +355,11 @@ class BinanceFuturesExecutor:
                     # needs reduceOnly explicit.
                     if not self._dual_side:
                         tp_kwargs["reduceOnly"] = True
-                    tp_order = self._create_order_with_mode_fallback(
+                    # Conditional order types (TAKE_PROFIT_MARKET included)
+                    # moved to Binance's separate Algo Order endpoint on
+                    # 2025-12-09 — the old /fapi/v1/order endpoint now
+                    # hard-rejects them with -4120.
+                    tp_order = self._create_algo_order_with_mode_fallback(
                         signal_side=side, **tp_kwargs
                     )
                 except BinanceAPIException as e:
